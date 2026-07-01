@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker, CircuitOpenError
-from reliability_lab.providers import FakeLLMProvider, ProviderError, ProviderResponse
+from reliability_lab.providers import FakeLLMProvider, ProviderError
 
 
 @dataclass(slots=True)
@@ -58,4 +58,35 @@ class ReliabilityGateway:
         BONUS TODO: Add cost budget tracking — if cumulative cost exceeds a threshold,
         skip expensive providers and route to cache or cheaper fallback.
         """
-        raise NotImplementedError("TODO: implement complete()")
+        if self.cache is not None:
+            cached_text, score = self.cache.get(prompt)
+            if cached_text is not None:
+                return GatewayResponse(cached_text, f"cache_hit:{score:.2f}", None, True, 0.0, 0.0)
+
+        last_error: str | None = None
+        for index, provider in enumerate(self.providers):
+            breaker = self.breakers[provider.name]
+            try:
+                response = breaker.call(provider.complete, prompt)
+            except (ProviderError, CircuitOpenError) as exc:
+                last_error = f"{provider.name}: {exc}"
+                continue
+            if self.cache is not None:
+                self.cache.set(prompt, response.text, {"provider": provider.name})
+            return GatewayResponse(
+                response.text,
+                "primary" if index == 0 else "fallback",
+                response.provider,
+                False,
+                response.latency_ms,
+                response.estimated_cost,
+            )
+        return GatewayResponse(
+            "The service is temporarily degraded. Please try again soon.",
+            "static_fallback",
+            None,
+            False,
+            0.0,
+            0.0,
+            last_error,
+        )
